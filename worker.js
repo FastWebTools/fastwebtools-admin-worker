@@ -4,7 +4,7 @@
 // Deployed from: github.com/FastWebTools/fastwebtools-admin-worker
 // ================================================================
 
-const WORKER_VERSION = "1.0.3-github";
+const WORKER_VERSION = "1.0.4-github";
 const DEPLOYED_AT = "2026-07-27";
 
 const CORS = {
@@ -99,11 +99,7 @@ export default {
       if (!auth.ok) return json({ success: false, error: "Unauthorized" }, 401);
 
       // ---------- STATS ----------
-      // FIX (v1.0.3): pehle `total_visitors` alias unique_visitors ko point
-      // kar raha tha (5), isliye dashboard pe stuck lag raha tha. Ab wo
-      // TOTAL visits count (21) return karta hai — jo user ki mental model
-      // "Total Visitors" se match karta hai. Unique visitors alag key me
-      // available hai agar future me chahiye.
+      // total_visitors = total visits count (21+), not unique (5).
       if (path === "/admin/stats" && request.method === "GET") {
         const totalVisits = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
         const uniqueVisitors = await env.DB.prepare("SELECT COUNT(DISTINCT visitor_id) AS n FROM visits").first();
@@ -126,7 +122,6 @@ export default {
           stats: {
             total_visits: totalVisitsN,
             unique_visitors: uniqueN,
-            // Dashboard "Total Visitors" card = total visits (21), not unique (5).
             total_visitors: totalVisitsN,
             total_comments: totalComments?.n || 0,
             total_article_likes: articleLikes,
@@ -138,26 +133,34 @@ export default {
       }
 
       // ---------- LIVE NOW ----------
-      // FIX (v1.0.3): 3-minute window itni tight thi ke practically hamesha
-      // 0 aata tha (single user ka visit register hone se pehle window expire
-      // ho jati thi). 15-minute window use karte hain jo kaafi realistic
-      // "abhi active" signal deta hai. Saath total visits bhi bhejte hain
-      // taake frontend fallback dikha sake agar zero ho.
+      // v1.0.4: heartbeat-based. Blog snippet pings /heartbeat every 15s
+      // while tab is visible, and sends /leave via navigator.sendBeacon()
+      // when the page closes/hides. "Live" = active_sessions rows whose
+      // last_seen is within the last 30 seconds. Because the admin
+      // dashboard polls this every ~3s, the count reacts near-instantly.
+      //
+      // Cleanup: also delete any stale rows older than 2 minutes on every
+      // call so the table stays tiny (no cron needed).
       if (path === "/admin/visitors/realtime" && request.method === "GET") {
-        const fifteenMinAgo = Date.now() - 15 * 60 * 1000;
+        const now = Date.now();
+        const liveThreshold = now - 30 * 1000;     // 30 seconds
+        const staleThreshold = now - 2 * 60 * 1000; // 2 minutes
+        await env.DB.prepare(
+          "DELETE FROM active_sessions WHERE last_seen < ?"
+        ).bind(staleThreshold).run();
         const row = await env.DB.prepare(
-          "SELECT COUNT(DISTINCT visitor_id) AS live FROM visits WHERE created_at > ?"
-        ).bind(fifteenMinAgo).first();
+          "SELECT COUNT(*) AS live FROM active_sessions WHERE last_seen > ?"
+        ).bind(liveThreshold).first();
         const totalRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
         return json({
           success: true,
           live: row?.live || 0,
-          window_minutes: 15,
+          threshold_seconds: 30,
           total_visits: totalRow?.n || 0,
         });
       }
 
-      // ---------- POPULAR ARTICLES (sirf real .html URLs) ----------
+      // ---------- POPULAR ARTICLES ----------
       if (path === "/admin/popular-articles" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 50);
         const { results } = await env.DB.prepare(
@@ -171,7 +174,7 @@ export default {
         return json({ success: true, articles: results || [] });
       }
 
-      // ---------- POPULAR TOOLS (usage count) ----------
+      // ---------- POPULAR TOOLS ----------
       if (path === "/admin/popular-tools" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 100);
         const { results } = await env.DB.prepare(
@@ -198,7 +201,7 @@ export default {
         return json({ success: true, articles: results || [] });
       }
 
-      // ---------- DAILY ACTIVITY (last 14 days) ----------
+      // ---------- DAILY ACTIVITY ----------
       if (path === "/admin/daily-activity" && request.method === "GET") {
         const days = Math.min(parseInt(url.searchParams.get("days") || "14", 10), 60);
         const since = Date.now() - days * 24 * 60 * 60 * 1000;
@@ -258,6 +261,7 @@ export default {
           env.DB.prepare("DELETE FROM article_likes"),
           env.DB.prepare("DELETE FROM tool_likes"),
           env.DB.prepare("DELETE FROM tool_usage"),
+          env.DB.prepare("DELETE FROM active_sessions"),
         ]);
         return json({ success: true, cleared: true });
       }
