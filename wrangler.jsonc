@@ -1,0 +1,12 @@
+{
+  "name": "fastwebtools-admin",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-23",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fastwebtools-db",
+      "database_id": "bc6c2d76-bc0b-4106-81ff-20b771800e8c"
+    }
+  ]
+}
