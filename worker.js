@@ -4,7 +4,7 @@
 // Deployed from: github.com/FastWebTools/fastwebtools-admin-worker
 // ================================================================
 
-const WORKER_VERSION = "1.0.2-github";
+const WORKER_VERSION = "1.0.3-github";
 const DEPLOYED_AT = "2026-07-27";
 
 const CORS = {
@@ -99,10 +99,11 @@ export default {
       if (!auth.ok) return json({ success: false, error: "Unauthorized" }, 401);
 
       // ---------- STATS ----------
-      // FIX: dashboard `total_visitors` aur `total_tool_uses` keys dhoondhta tha
-      // jo pehle response me the hi nahi — isliye Total Visitors "—" aur Tool
-      // Usage "0" show ho raha tha. Ab dono keys return karte hain, plus
-      // article/tool likes ka breakdown bhi.
+      // FIX (v1.0.3): pehle `total_visitors` alias unique_visitors ko point
+      // kar raha tha (5), isliye dashboard pe stuck lag raha tha. Ab wo
+      // TOTAL visits count (21) return karta hai — jo user ki mental model
+      // "Total Visitors" se match karta hai. Unique visitors alag key me
+      // available hai agar future me chahiye.
       if (path === "/admin/stats" && request.method === "GET") {
         const totalVisits = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
         const uniqueVisitors = await env.DB.prepare("SELECT COUNT(DISTINCT visitor_id) AS n FROM visits").first();
@@ -118,13 +119,15 @@ export default {
         ).first();
         const articleLikes = Number(articleLikesRow?.n || 0);
         const toolLikes = Number(toolLikesRow?.n || 0);
+        const totalVisitsN = Number(totalVisits?.n || 0);
+        const uniqueN = Number(uniqueVisitors?.n || 0);
         return json({
           success: true,
           stats: {
-            total_visits: totalVisits?.n || 0,
-            unique_visitors: uniqueVisitors?.n || 0,
-            // Alias so the dashboard's `total_visitors` pick works out of the box.
-            total_visitors: uniqueVisitors?.n || 0,
+            total_visits: totalVisitsN,
+            unique_visitors: uniqueN,
+            // Dashboard "Total Visitors" card = total visits (21), not unique (5).
+            total_visitors: totalVisitsN,
             total_comments: totalComments?.n || 0,
             total_article_likes: articleLikes,
             total_tool_likes: toolLikes,
@@ -134,13 +137,24 @@ export default {
         });
       }
 
-      // ---------- LIVE NOW (last 3 min unique visitors) ----------
+      // ---------- LIVE NOW ----------
+      // FIX (v1.0.3): 3-minute window itni tight thi ke practically hamesha
+      // 0 aata tha (single user ka visit register hone se pehle window expire
+      // ho jati thi). 15-minute window use karte hain jo kaafi realistic
+      // "abhi active" signal deta hai. Saath total visits bhi bhejte hain
+      // taake frontend fallback dikha sake agar zero ho.
       if (path === "/admin/visitors/realtime" && request.method === "GET") {
-        const threeMinAgo = Date.now() - 3 * 60 * 1000;
+        const fifteenMinAgo = Date.now() - 15 * 60 * 1000;
         const row = await env.DB.prepare(
           "SELECT COUNT(DISTINCT visitor_id) AS live FROM visits WHERE created_at > ?"
-        ).bind(threeMinAgo).first();
-        return json({ success: true, live: row?.live || 0 });
+        ).bind(fifteenMinAgo).first();
+        const totalRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
+        return json({
+          success: true,
+          live: row?.live || 0,
+          window_minutes: 15,
+          total_visits: totalRow?.n || 0,
+        });
       }
 
       // ---------- POPULAR ARTICLES (sirf real .html URLs) ----------
@@ -166,7 +180,7 @@ export default {
         return json({ success: true, tools: results || [] });
       }
 
-      // ---------- TOOL LIKES (naya endpoint — kon sa tool kitna liked hai) ----------
+      // ---------- TOOL LIKES ----------
       if (path === "/admin/tool-likes" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 100);
         const { results } = await env.DB.prepare(
@@ -175,7 +189,7 @@ export default {
         return json({ success: true, tools: results || [] });
       }
 
-      // ---------- ARTICLE LIKES (bonus: symmetry ke liye) ----------
+      // ---------- ARTICLE LIKES ----------
       if (path === "/admin/article-likes" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 100);
         const { results } = await env.DB.prepare(
