@@ -4,7 +4,7 @@
 // Deployed from: github.com/FastWebTools/fastwebtools-admin-worker
 // ================================================================
 
-const WORKER_VERSION = "1.0.4-github";
+const WORKER_VERSION = "1.0.5-github";
 const DEPLOYED_AT = "2026-07-27";
 
 const CORS = {
@@ -19,6 +19,13 @@ const json = (data, status = 200) =>
     status,
     headers: { "Content-Type": "application/json", ...CORS },
   });
+
+// SQL fragment matching a real blog article URL, e.g.
+//   https://www.fastwebtools.online/2026/07/some-post.html
+// Used by /admin/stats (total_blog_views) and /admin/visitors/realtime
+// so the dashboard's Blog Views card counts only real article visits
+// (not homepage, tool pages, search, etc).
+const BLOG_ARTICLE_LIKE = "https://www.fastwebtools.online/2%/%.html";
 
 async function sha256(text) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
@@ -99,10 +106,16 @@ export default {
       if (!auth.ok) return json({ success: false, error: "Unauthorized" }, 401);
 
       // ---------- STATS ----------
-      // total_visitors = total visits count (21+), not unique (5).
+      // v1.0.5: added total_blog_views — counts only real blog article
+      // visits (URLs like https://www.fastwebtools.online/2XXX/XX/*.html),
+      // not homepage/tool pages/search. Used by the dashboard's new
+      // "Blog Views" stat card.
       if (path === "/admin/stats" && request.method === "GET") {
         const totalVisits = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
         const uniqueVisitors = await env.DB.prepare("SELECT COUNT(DISTINCT visitor_id) AS n FROM visits").first();
+        const totalBlogViews = await env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM visits WHERE article_id LIKE ?"
+        ).bind(BLOG_ARTICLE_LIKE).first();
         const totalComments = await env.DB.prepare("SELECT COUNT(*) AS n FROM comments").first();
         const articleLikesRow = await env.DB.prepare(
           "SELECT COALESCE(SUM(likes),0) AS n FROM article_likes"
@@ -117,12 +130,14 @@ export default {
         const toolLikes = Number(toolLikesRow?.n || 0);
         const totalVisitsN = Number(totalVisits?.n || 0);
         const uniqueN = Number(uniqueVisitors?.n || 0);
+        const totalBlogViewsN = Number(totalBlogViews?.n || 0);
         return json({
           success: true,
           stats: {
             total_visits: totalVisitsN,
             unique_visitors: uniqueN,
             total_visitors: totalVisitsN,
+            total_blog_views: totalBlogViewsN,
             total_comments: totalComments?.n || 0,
             total_article_likes: articleLikes,
             total_tool_likes: toolLikes,
@@ -139,6 +154,10 @@ export default {
       // last_seen is within the last 30 seconds. Because the admin
       // dashboard polls this every ~3s, the count reacts near-instantly.
       //
+      // v1.0.5: also returns total_visits + total_blog_views so the
+      // dashboard's Total Visitors and Blog Views cards update on every
+      // 3-second poll (near-instant) instead of only every 15 seconds.
+      //
       // Cleanup: also delete any stale rows older than 2 minutes on every
       // call so the table stays tiny (no cron needed).
       if (path === "/admin/visitors/realtime" && request.method === "GET") {
@@ -152,11 +171,15 @@ export default {
           "SELECT COUNT(*) AS live FROM active_sessions WHERE last_seen > ?"
         ).bind(liveThreshold).first();
         const totalRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
+        const blogRow = await env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM visits WHERE article_id LIKE ?"
+        ).bind(BLOG_ARTICLE_LIKE).first();
         return json({
           success: true,
           live: row?.live || 0,
           threshold_seconds: 30,
-          total_visits: totalRow?.n || 0,
+          total_visits: Number(totalRow?.n || 0),
+          total_blog_views: Number(blogRow?.n || 0),
         });
       }
 
@@ -166,11 +189,11 @@ export default {
         const { results } = await env.DB.prepare(
           `SELECT article_id AS name, article_id AS url, COUNT(*) AS count
            FROM visits
-           WHERE article_id LIKE 'https://www.fastwebtools.online/2%/%.html'
+           WHERE article_id LIKE ?
            GROUP BY article_id
            ORDER BY count DESC
            LIMIT ?`
-        ).bind(limit).all();
+        ).bind(BLOG_ARTICLE_LIKE, limit).all();
         return json({ success: true, articles: results || [] });
       }
 
