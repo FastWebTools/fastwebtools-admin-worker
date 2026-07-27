@@ -1,7 +1,11 @@
 // ================================================================
 // fastwebtools-admin  —  Admin API Backend
 // Bindings required:  DB (D1: fastwebtools-db)
+// Deployed from: github.com/FastWebTools/fastwebtools-admin-worker
 // ================================================================
+
+const WORKER_VERSION = "1.0.1-github";
+const DEPLOYED_AT = "2026-07-27";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -47,6 +51,18 @@ export default {
     const path = url.pathname;
 
     try {
+      // ---------- VERSION (public, no auth) ----------
+      if (path === "/version" && request.method === "GET") {
+        return json({
+          success: true,
+          worker: "fastwebtools-admin",
+          version: WORKER_VERSION,
+          deployed_at: DEPLOYED_AT,
+          source: "github.com/FastWebTools/fastwebtools-admin-worker",
+          server_time: new Date().toISOString(),
+        });
+      }
+
       // ---------- LOGIN ----------
       if (path === "/admin/login" && request.method === "POST") {
         const { username, password } = await request.json();
