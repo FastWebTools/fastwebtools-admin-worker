@@ -4,7 +4,7 @@
 // Deployed from: github.com/FastWebTools/fastwebtools-admin-worker
 // ================================================================
 
-const WORKER_VERSION = "1.0.1-github";
+const WORKER_VERSION = "1.0.2-github";
 const DEPLOYED_AT = "2026-07-27";
 
 const CORS = {
@@ -99,20 +99,37 @@ export default {
       if (!auth.ok) return json({ success: false, error: "Unauthorized" }, 401);
 
       // ---------- STATS ----------
+      // FIX: dashboard `total_visitors` aur `total_tool_uses` keys dhoondhta tha
+      // jo pehle response me the hi nahi — isliye Total Visitors "—" aur Tool
+      // Usage "0" show ho raha tha. Ab dono keys return karte hain, plus
+      // article/tool likes ka breakdown bhi.
       if (path === "/admin/stats" && request.method === "GET") {
         const totalVisits = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
         const uniqueVisitors = await env.DB.prepare("SELECT COUNT(DISTINCT visitor_id) AS n FROM visits").first();
         const totalComments = await env.DB.prepare("SELECT COUNT(*) AS n FROM comments").first();
-        const totalLikes = await env.DB.prepare(
-          "SELECT (SELECT COALESCE(SUM(likes),0) FROM article_likes) + (SELECT COALESCE(SUM(likes),0) FROM tool_likes) AS n"
+        const articleLikesRow = await env.DB.prepare(
+          "SELECT COALESCE(SUM(likes),0) AS n FROM article_likes"
         ).first();
+        const toolLikesRow = await env.DB.prepare(
+          "SELECT COALESCE(SUM(likes),0) AS n FROM tool_likes"
+        ).first();
+        const toolUsesRow = await env.DB.prepare(
+          "SELECT COALESCE(SUM(uses),0) AS n FROM tool_usage"
+        ).first();
+        const articleLikes = Number(articleLikesRow?.n || 0);
+        const toolLikes = Number(toolLikesRow?.n || 0);
         return json({
           success: true,
           stats: {
             total_visits: totalVisits?.n || 0,
             unique_visitors: uniqueVisitors?.n || 0,
+            // Alias so the dashboard's `total_visitors` pick works out of the box.
+            total_visitors: uniqueVisitors?.n || 0,
             total_comments: totalComments?.n || 0,
-            total_likes: totalLikes?.n || 0,
+            total_article_likes: articleLikes,
+            total_tool_likes: toolLikes,
+            total_likes: articleLikes + toolLikes,
+            total_tool_uses: toolUsesRow?.n || 0,
           },
         });
       }
@@ -140,13 +157,31 @@ export default {
         return json({ success: true, articles: results || [] });
       }
 
-      // ---------- POPULAR TOOLS ----------
+      // ---------- POPULAR TOOLS (usage count) ----------
       if (path === "/admin/popular-tools" && request.method === "GET") {
-        const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 50);
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 100);
         const { results } = await env.DB.prepare(
-          "SELECT tool_id AS name, uses AS count FROM tool_usage ORDER BY uses DESC LIMIT ?"
+          "SELECT tool_id AS name, uses AS count FROM tool_usage WHERE uses > 0 ORDER BY uses DESC LIMIT ?"
         ).bind(limit).all();
         return json({ success: true, tools: results || [] });
+      }
+
+      // ---------- TOOL LIKES (naya endpoint — kon sa tool kitna liked hai) ----------
+      if (path === "/admin/tool-likes" && request.method === "GET") {
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 100);
+        const { results } = await env.DB.prepare(
+          "SELECT tool_id AS name, likes AS count FROM tool_likes WHERE likes > 0 ORDER BY likes DESC LIMIT ?"
+        ).bind(limit).all();
+        return json({ success: true, tools: results || [] });
+      }
+
+      // ---------- ARTICLE LIKES (bonus: symmetry ke liye) ----------
+      if (path === "/admin/article-likes" && request.method === "GET") {
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 100);
+        const { results } = await env.DB.prepare(
+          "SELECT article_id AS name, article_id AS url, likes AS count FROM article_likes WHERE likes > 0 ORDER BY likes DESC LIMIT ?"
+        ).bind(limit).all();
+        return json({ success: true, articles: results || [] });
       }
 
       // ---------- DAILY ACTIVITY (last 14 days) ----------
