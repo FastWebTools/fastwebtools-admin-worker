@@ -4,8 +4,8 @@
 // Deployed from: github.com/FastWebTools/fastwebtools-admin-worker
 // ================================================================
 
-const WORKER_VERSION = "1.0.5-github";
-const DEPLOYED_AT = "2026-07-27";
+const WORKER_VERSION = "1.0.6-github";
+const DEPLOYED_AT = "2026-07-29";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -22,10 +22,21 @@ const json = (data, status = 200) =>
 
 // SQL fragment matching a real blog article URL, e.g.
 //   https://www.fastwebtools.online/2026/07/some-post.html
-// Used by /admin/stats (total_blog_views) and /admin/visitors/realtime
-// so the dashboard's Blog Views card counts only real article visits
-// (not homepage, tool pages, search, etc).
 const BLOG_ARTICLE_LIKE = "https://www.fastwebtools.online/2%/%.html";
+
+// v1.0.6: parse optional ?from=YYYY-MM-DD&to=YYYY-MM-DD query params into ms.
+// Returns null if not both present or invalid. Range is inclusive of both days.
+function parseDateRange(url) {
+  const from = url.searchParams.get("from");
+  const to = url.searchParams.get("to");
+  if (!from || !to) return null;
+  const reDate = /^\d{4}-\d{2}-\d{2}$/;
+  if (!reDate.test(from) || !reDate.test(to)) return null;
+  const fromMs = new Date(from + "T00:00:00.000Z").getTime();
+  const toMs = new Date(to + "T23:59:59.999Z").getTime();
+  if (isNaN(fromMs) || isNaN(toMs) || fromMs > toMs) return null;
+  return { fromMs, toMs, from, to };
+}
 
 async function sha256(text) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
@@ -80,7 +91,7 @@ export default {
         ).bind(username, hash).first();
         if (!admin) return json({ success: false, error: "Invalid credentials" }, 401);
         const token = randomToken();
-        const expires = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 din
+        const expires = Date.now() + 7 * 24 * 60 * 60 * 1000;
         await env.DB.prepare(
           "INSERT INTO admin_sessions (token, username, expires_at) VALUES (?, ?, ?)"
         ).bind(token, username, expires).run();
@@ -101,22 +112,38 @@ export default {
         return json({ success: true });
       }
 
-      // ---- Har endpoint ke aage auth check ----
+      // ---- Auth check ----
       const auth = await checkAuth(request, env);
       if (!auth.ok) return json({ success: false, error: "Unauthorized" }, 401);
 
       // ---------- STATS ----------
-      // v1.0.5: added total_blog_views — counts only real blog article
-      // visits (URLs like https://www.fastwebtools.online/2XXX/XX/*.html),
-      // not homepage/tool pages/search. Used by the dashboard's new
-      // "Blog Views" stat card.
+      // v1.0.6: Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD filters visits, unique
+      // visitors, blog views, and comments. Likes and tool usage stay all-time
+      // because their tables store aggregate counts (no per-event timestamps).
       if (path === "/admin/stats" && request.method === "GET") {
-        const totalVisits = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
-        const uniqueVisitors = await env.DB.prepare("SELECT COUNT(DISTINCT visitor_id) AS n FROM visits").first();
-        const totalBlogViews = await env.DB.prepare(
-          "SELECT COUNT(*) AS n FROM visits WHERE article_id LIKE ?"
-        ).bind(BLOG_ARTICLE_LIKE).first();
-        const totalComments = await env.DB.prepare("SELECT COUNT(*) AS n FROM comments").first();
+        const range = parseDateRange(url);
+        let totalVisitsRow, uniqueVisitorsRow, totalBlogViewsRow, totalCommentsRow;
+        if (range) {
+          totalVisitsRow = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM visits WHERE created_at BETWEEN ? AND ?"
+          ).bind(range.fromMs, range.toMs).first();
+          uniqueVisitorsRow = await env.DB.prepare(
+            "SELECT COUNT(DISTINCT visitor_id) AS n FROM visits WHERE created_at BETWEEN ? AND ?"
+          ).bind(range.fromMs, range.toMs).first();
+          totalBlogViewsRow = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM visits WHERE article_id LIKE ? AND created_at BETWEEN ? AND ?"
+          ).bind(BLOG_ARTICLE_LIKE, range.fromMs, range.toMs).first();
+          totalCommentsRow = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM comments WHERE created_at BETWEEN ? AND ?"
+          ).bind(range.fromMs, range.toMs).first();
+        } else {
+          totalVisitsRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
+          uniqueVisitorsRow = await env.DB.prepare("SELECT COUNT(DISTINCT visitor_id) AS n FROM visits").first();
+          totalBlogViewsRow = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM visits WHERE article_id LIKE ?"
+          ).bind(BLOG_ARTICLE_LIKE).first();
+          totalCommentsRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM comments").first();
+        }
         const articleLikesRow = await env.DB.prepare(
           "SELECT COALESCE(SUM(likes),0) AS n FROM article_likes"
         ).first();
@@ -128,17 +155,19 @@ export default {
         ).first();
         const articleLikes = Number(articleLikesRow?.n || 0);
         const toolLikes = Number(toolLikesRow?.n || 0);
-        const totalVisitsN = Number(totalVisits?.n || 0);
-        const uniqueN = Number(uniqueVisitors?.n || 0);
-        const totalBlogViewsN = Number(totalBlogViews?.n || 0);
+        const totalVisitsN = Number(totalVisitsRow?.n || 0);
+        const uniqueN = Number(uniqueVisitorsRow?.n || 0);
+        const totalBlogViewsN = Number(totalBlogViewsRow?.n || 0);
         return json({
           success: true,
+          filtered: !!range,
+          range: range ? { from: range.from, to: range.to } : null,
           stats: {
             total_visits: totalVisitsN,
             unique_visitors: uniqueN,
             total_visitors: totalVisitsN,
             total_blog_views: totalBlogViewsN,
-            total_comments: totalComments?.n || 0,
+            total_comments: totalCommentsRow?.n || 0,
             total_article_likes: articleLikes,
             total_tool_likes: toolLikes,
             total_likes: articleLikes + toolLikes,
@@ -148,22 +177,12 @@ export default {
       }
 
       // ---------- LIVE NOW ----------
-      // v1.0.4: heartbeat-based. Blog snippet pings /heartbeat every 15s
-      // while tab is visible, and sends /leave via navigator.sendBeacon()
-      // when the page closes/hides. "Live" = active_sessions rows whose
-      // last_seen is within the last 30 seconds. Because the admin
-      // dashboard polls this every ~3s, the count reacts near-instantly.
-      //
-      // v1.0.5: also returns total_visits + total_blog_views so the
-      // dashboard's Total Visitors and Blog Views cards update on every
-      // 3-second poll (near-instant) instead of only every 15 seconds.
-      //
-      // Cleanup: also delete any stale rows older than 2 minutes on every
-      // call so the table stays tiny (no cron needed).
+      // Live count + all-time visitors/blog-views. Ignores date filter
+      // (this endpoint is polled every 3s for real-time header).
       if (path === "/admin/visitors/realtime" && request.method === "GET") {
         const now = Date.now();
-        const liveThreshold = now - 30 * 1000;     // 30 seconds
-        const staleThreshold = now - 2 * 60 * 1000; // 2 minutes
+        const liveThreshold = now - 30 * 1000;
+        const staleThreshold = now - 2 * 60 * 1000;
         await env.DB.prepare(
           "DELETE FROM active_sessions WHERE last_seen < ?"
         ).bind(staleThreshold).run();
@@ -184,20 +203,36 @@ export default {
       }
 
       // ---------- POPULAR ARTICLES ----------
+      // v1.0.6: Supports ?from=&to= date filter (uses visits.created_at).
       if (path === "/admin/popular-articles" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 50);
-        const { results } = await env.DB.prepare(
-          `SELECT article_id AS name, article_id AS url, COUNT(*) AS count
-           FROM visits
-           WHERE article_id LIKE ?
-           GROUP BY article_id
-           ORDER BY count DESC
-           LIMIT ?`
-        ).bind(BLOG_ARTICLE_LIKE, limit).all();
-        return json({ success: true, articles: results || [] });
+        const range = parseDateRange(url);
+        let results;
+        if (range) {
+          const r = await env.DB.prepare(
+            `SELECT article_id AS name, article_id AS url, COUNT(*) AS count
+             FROM visits
+             WHERE article_id LIKE ? AND created_at BETWEEN ? AND ?
+             GROUP BY article_id
+             ORDER BY count DESC
+             LIMIT ?`
+          ).bind(BLOG_ARTICLE_LIKE, range.fromMs, range.toMs, limit).all();
+          results = r.results;
+        } else {
+          const r = await env.DB.prepare(
+            `SELECT article_id AS name, article_id AS url, COUNT(*) AS count
+             FROM visits
+             WHERE article_id LIKE ?
+             GROUP BY article_id
+             ORDER BY count DESC
+             LIMIT ?`
+          ).bind(BLOG_ARTICLE_LIKE, limit).all();
+          results = r.results;
+        }
+        return json({ success: true, filtered: !!range, articles: results || [] });
       }
 
-      // ---------- POPULAR TOOLS ----------
+      // ---------- POPULAR TOOLS (aggregate, no date) ----------
       if (path === "/admin/popular-tools" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 100);
         const { results } = await env.DB.prepare(
@@ -206,7 +241,7 @@ export default {
         return json({ success: true, tools: results || [] });
       }
 
-      // ---------- TOOL LIKES ----------
+      // ---------- TOOL LIKES (aggregate, no date) ----------
       if (path === "/admin/tool-likes" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 100);
         const { results } = await env.DB.prepare(
@@ -215,7 +250,7 @@ export default {
         return json({ success: true, tools: results || [] });
       }
 
-      // ---------- ARTICLE LIKES ----------
+      // ---------- ARTICLE LIKES (aggregate, no date) ----------
       if (path === "/admin/article-likes" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 100);
         const { results } = await env.DB.prepare(
@@ -225,25 +260,45 @@ export default {
       }
 
       // ---------- DAILY ACTIVITY ----------
+      // v1.0.6: Supports ?from=&to= date filter, falls back to legacy ?days=.
       if (path === "/admin/daily-activity" && request.method === "GET") {
-        const days = Math.min(parseInt(url.searchParams.get("days") || "14", 10), 60);
-        const since = Date.now() - days * 24 * 60 * 60 * 1000;
+        const range = parseDateRange(url);
+        let sinceMs, untilMs;
+        if (range) {
+          sinceMs = range.fromMs;
+          untilMs = range.toMs;
+        } else {
+          const days = Math.min(parseInt(url.searchParams.get("days") || "14", 10), 62);
+          sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+          untilMs = Date.now();
+        }
         const { results } = await env.DB.prepare(
           `SELECT date(created_at/1000, 'unixepoch') AS day, COUNT(*) AS visits
            FROM visits
-           WHERE created_at > ?
+           WHERE created_at BETWEEN ? AND ?
            GROUP BY day
            ORDER BY day ASC`
-        ).bind(since).all();
-        return json({ success: true, activity: results || [] });
+        ).bind(sinceMs, untilMs).all();
+        return json({ success: true, filtered: !!range, activity: results || [] });
       }
 
       // ---------- COMMENTS LIST ----------
+      // v1.0.6: Supports ?from=&to= date filter, raises limit when filtered.
       if (path === "/admin/comments" && request.method === "GET") {
-        const { results } = await env.DB.prepare(
-          "SELECT id, article_id, name, comment, status, created_at FROM comments ORDER BY id DESC LIMIT 200"
-        ).all();
-        return json({ success: true, comments: results || [] });
+        const range = parseDateRange(url);
+        let results;
+        if (range) {
+          const r = await env.DB.prepare(
+            "SELECT id, article_id, name, comment, status, created_at FROM comments WHERE created_at BETWEEN ? AND ? ORDER BY id DESC LIMIT 500"
+          ).bind(range.fromMs, range.toMs).all();
+          results = r.results;
+        } else {
+          const r = await env.DB.prepare(
+            "SELECT id, article_id, name, comment, status, created_at FROM comments ORDER BY id DESC LIMIT 500"
+          ).all();
+          results = r.results;
+        }
+        return json({ success: true, filtered: !!range, comments: results || [] });
       }
 
       // ---------- COMMENT DELETE / STATUS ----------
