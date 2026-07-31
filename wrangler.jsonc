@@ -1,3 +1,5 @@
+// FastWebTools admin backend — Cloudflare Worker + D1
+// Latest deploy: v1.0.7 - robust DATE_FILTER (int ms + int sec + ISO text) + /admin/diag
 {
   "name": "fastwebtools-admin",
   "main": "worker.js",
