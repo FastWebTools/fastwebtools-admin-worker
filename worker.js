@@ -3,8 +3,8 @@
 // Bindings required:  DB (D1: fastwebtools-db)
 // ================================================================
 
-const WORKER_VERSION = "1.0.7-github";
-const DEPLOYED_AT = "2026-07-31";
+const WORKER_VERSION = "1.0.8-github";
+const DEPLOYED_AT = "2026-08-01";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -26,8 +26,6 @@ const json = (data, status = 200) =>
 
 const BLOG_ARTICLE_LIKE = "https://www.fastwebtools.online/2%/%.html";
 
-// v1.0.7: parse ?from=&to= into both ms integers AND ISO strings so we can
-// filter regardless of whether created_at is stored as integer ms or ISO text.
 function parseDateRange(url) {
   const from = url.searchParams.get("from");
   const to = url.searchParams.get("to");
@@ -42,9 +40,6 @@ function parseDateRange(url) {
   return { fromMs, toMs, from, to, fromISO, toISO };
 }
 
-// v1.0.7: robust WHERE clause fragment. created_at may be stored as either
-// integer ms since epoch, integer seconds, or ISO 8601 text. This handles all
-// three. Bind 6 params: [fromMs, toMs, fromMs, toMs, fromISO, toISO].
 const DATE_FILTER = `(
   (typeof(created_at)='integer' AND created_at > 9999999999 AND created_at BETWEEN ? AND ?)
   OR (typeof(created_at)='integer' AND created_at <= 9999999999 AND created_at BETWEEN CAST(? / 1000 AS INTEGER) AND CAST(? / 1000 AS INTEGER))
@@ -52,7 +47,6 @@ const DATE_FILTER = `(
 )`;
 function dfBinds(r) { return [r.fromMs, r.toMs, r.fromMs, r.toMs, r.fromISO, r.toISO]; }
 
-// Normalize created_at to a YYYY-MM-DD string for GROUP BY.
 const DAY_EXPR = `CASE
   WHEN typeof(created_at)='integer' AND created_at > 9999999999 THEN date(created_at/1000, 'unixepoch')
   WHEN typeof(created_at)='integer' AND created_at <= 9999999999 THEN date(created_at, 'unixepoch')
@@ -133,11 +127,14 @@ export default {
       const auth = await checkAuth(request, env);
       if (!auth.ok) return json({ success: false, error: "Unauthorized" }, 401);
 
-      // ---------- DIAGNOSTIC (v1.0.7) ----------
+      // ---------- DIAGNOSTIC (v1.0.8: also reports event log stats) ----------
       if (path === "/admin/diag" && request.method === "GET") {
         const v = await env.DB.prepare("SELECT id, article_id, created_at, typeof(created_at) AS ct FROM visits ORDER BY id DESC LIMIT 5").all();
         const c = await env.DB.prepare("SELECT id, article_id, created_at, typeof(created_at) AS ct FROM comments ORDER BY id DESC LIMIT 5").all();
         const al = await env.DB.prepare("SELECT article_id, likes FROM article_likes ORDER BY likes DESC LIMIT 10").all();
+        let tueStats = null, tleStats = null;
+        try { tueStats = (await env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS min_ts, MAX(created_at) AS max_ts FROM tool_usage_events").first()) || null; } catch (e) { tueStats = { error: String(e && e.message || e) }; }
+        try { tleStats = (await env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS min_ts, MAX(created_at) AS max_ts FROM tool_like_events").first()) || null; } catch (e) { tleStats = { error: String(e && e.message || e) }; }
         return json({
           success: true,
           worker_version: WORKER_VERSION,
@@ -146,6 +143,8 @@ export default {
           sample_visits: v.results || [],
           sample_comments: c.results || [],
           sample_article_likes: al.results || [],
+          tool_usage_events_stats: tueStats,
+          tool_like_events_stats: tleStats,
         });
       }
 
@@ -259,20 +258,68 @@ export default {
         return json({ success: true, filtered: !!range, articles: results || [] });
       }
 
+      // v1.0.8: when date range is present, query tool_usage_events log
+      // (each POST /tool-usage inserts an event via api-worker v1.0.5+) so
+      // Top Tools filters correctly. Without range, keep the fast counter
+      // path for backwards compatibility.
       if (path === "/admin/popular-tools" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "10", 10), 1000);
-        const { results } = await env.DB.prepare(
-          "SELECT tool_id AS name, uses AS count FROM tool_usage WHERE uses > 0 ORDER BY uses DESC LIMIT ?"
-        ).bind(limit).all();
-        return json({ success: true, tools: results || [] });
+        const range = parseDateRange(url);
+        let results;
+        if (range) {
+          const df = dfBinds(range);
+          try {
+            const r = await env.DB.prepare(
+              `SELECT tool_id AS name, COUNT(*) AS count
+               FROM tool_usage_events
+               WHERE ${DATE_FILTER}
+               GROUP BY tool_id
+               ORDER BY count DESC
+               LIMIT ?`
+            ).bind(...df, limit).all();
+            results = r.results;
+          } catch (e) {
+            // Table not created yet — api-worker still on pre-v1.0.5.
+            results = [];
+          }
+        } else {
+          const r = await env.DB.prepare(
+            "SELECT tool_id AS name, uses AS count FROM tool_usage WHERE uses > 0 ORDER BY uses DESC LIMIT ?"
+          ).bind(limit).all();
+          results = r.results;
+        }
+        return json({ success: true, filtered: !!range, tools: results || [] });
       }
 
+      // v1.0.8: when date range is present, SUM(delta) from tool_like_events
+      // per tool. delta is +1 for like, -1 for unlike so net likes shown.
       if (path === "/admin/tool-likes" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 1000);
-        const { results } = await env.DB.prepare(
-          "SELECT tool_id AS name, likes AS count FROM tool_likes WHERE likes > 0 ORDER BY likes DESC LIMIT ?"
-        ).bind(limit).all();
-        return json({ success: true, tools: results || [] });
+        const range = parseDateRange(url);
+        let results;
+        if (range) {
+          const df = dfBinds(range);
+          try {
+            const r = await env.DB.prepare(
+              `SELECT tool_id AS name, SUM(delta) AS count
+               FROM tool_like_events
+               WHERE ${DATE_FILTER}
+               GROUP BY tool_id
+               HAVING SUM(delta) > 0
+               ORDER BY count DESC
+               LIMIT ?`
+            ).bind(...df, limit).all();
+            results = r.results;
+          } catch (e) {
+            results = [];
+          }
+        } else {
+          const r = await env.DB.prepare(
+            "SELECT tool_id AS name, likes AS count FROM tool_likes WHERE likes > 0 ORDER BY likes DESC LIMIT ?"
+          ).bind(limit).all();
+          results = r.results;
+        }
+        return json({ success: true, filtered: !!range, tools: results || [] });
       }
 
       if (path === "/admin/article-likes" && request.method === "GET") {
@@ -371,6 +418,9 @@ export default {
           env.DB.prepare("DELETE FROM tool_usage"),
           env.DB.prepare("DELETE FROM active_sessions"),
         ]);
+        // v1.0.8: also clear event logs when they exist.
+        try { await env.DB.prepare("DELETE FROM tool_usage_events").run(); } catch (e) {}
+        try { await env.DB.prepare("DELETE FROM tool_like_events").run(); } catch (e) {}
         return json({ success: true, cleared: true });
       }
 
