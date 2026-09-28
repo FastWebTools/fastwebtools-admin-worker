@@ -3,8 +3,8 @@
 // Bindings required:  DB (D1: fastwebtools-db)
 // ================================================================
 
-const WORKER_VERSION = "1.0.8-github";
-const DEPLOYED_AT = "2026-08-01";
+const WORKER_VERSION = "1.1.0-github";
+const DEPLOYED_AT = "2026-09-28";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -24,7 +24,14 @@ const json = (data, status = 200) =>
     },
   });
 
-const BLOG_ARTICLE_LIKE = "https://www.fastwebtools.online/2%/%.html";
+const BLOG_WHERE = `(
+  article_id LIKE 'https://www.fastwebtools.online/20__/__/%.html'
+  OR article_id LIKE 'http://www.fastwebtools.online/20__/__/%.html'
+  OR article_id LIKE 'https://fastwebtools.online/20__/__/%.html'
+  OR article_id LIKE 'http://fastwebtools.online/20__/__/%.html'
+  OR article_id LIKE '/20__/__/%.html'
+  OR article_id GLOB 'www-fastwebtools-online-20??-??-*-html'
+)`;
 
 function parseDateRange(url) {
   const from = url.searchParams.get("from");
@@ -132,9 +139,10 @@ export default {
         const v = await env.DB.prepare("SELECT id, article_id, created_at, typeof(created_at) AS ct FROM visits ORDER BY id DESC LIMIT 5").all();
         const c = await env.DB.prepare("SELECT id, article_id, created_at, typeof(created_at) AS ct FROM comments ORDER BY id DESC LIMIT 5").all();
         const al = await env.DB.prepare("SELECT article_id, likes FROM article_likes ORDER BY likes DESC LIMIT 10").all();
-        let tueStats = null, tleStats = null;
+        let tueStats = null, tleStats = null, aleStats = null;
         try { tueStats = (await env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS min_ts, MAX(created_at) AS max_ts FROM tool_usage_events").first()) || null; } catch (e) { tueStats = { error: String(e && e.message || e) }; }
         try { tleStats = (await env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS min_ts, MAX(created_at) AS max_ts FROM tool_like_events").first()) || null; } catch (e) { tleStats = { error: String(e && e.message || e) }; }
+        try { aleStats = (await env.DB.prepare("SELECT COUNT(*) AS n, MIN(created_at) AS min_ts, MAX(created_at) AS max_ts FROM article_like_events").first()) || null; } catch (e) { aleStats = { error: String(e && e.message || e) }; }
         return json({
           success: true,
           worker_version: WORKER_VERSION,
@@ -145,6 +153,7 @@ export default {
           sample_article_likes: al.results || [],
           tool_usage_events_stats: tueStats,
           tool_like_events_stats: tleStats,
+          article_like_events_stats: aleStats,
         });
       }
 
@@ -161,8 +170,8 @@ export default {
             `SELECT COUNT(DISTINCT visitor_id) AS n FROM visits WHERE ${DATE_FILTER}`
           ).bind(...df).first();
           totalBlogViewsRow = await env.DB.prepare(
-            `SELECT COUNT(*) AS n FROM visits WHERE article_id LIKE ? AND ${DATE_FILTER}`
-          ).bind(BLOG_ARTICLE_LIKE, ...df).first();
+            `SELECT COUNT(*) AS n FROM visits WHERE ${BLOG_WHERE} AND ${DATE_FILTER}`
+          ).bind(...df).first();
           totalCommentsRow = await env.DB.prepare(
             `SELECT COUNT(*) AS n FROM comments WHERE ${DATE_FILTER}`
           ).bind(...df).first();
@@ -170,21 +179,23 @@ export default {
           totalVisitsRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
           uniqueVisitorsRow = await env.DB.prepare("SELECT COUNT(DISTINCT visitor_id) AS n FROM visits").first();
           totalBlogViewsRow = await env.DB.prepare(
-            "SELECT COUNT(*) AS n FROM visits WHERE article_id LIKE ?"
-          ).bind(BLOG_ARTICLE_LIKE).first();
+            `SELECT COUNT(*) AS n FROM visits WHERE ${BLOG_WHERE}`
+          ).first();
           totalCommentsRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM comments").first();
         }
-        const articleLikesRow = await env.DB.prepare(
-          "SELECT COALESCE(SUM(likes),0) AS n FROM article_likes"
-        ).first();
-        const toolLikesRow = await env.DB.prepare(
-          "SELECT COALESCE(SUM(likes),0) AS n FROM tool_likes"
-        ).first();
-        const toolUsesRow = await env.DB.prepare(
-          "SELECT COALESCE(SUM(uses),0) AS n FROM tool_usage"
-        ).first();
-        const articleLikes = Number(articleLikesRow?.n || 0);
-        const toolLikes = Number(toolLikesRow?.n || 0);
+        let articleLikesRow, toolLikesRow, toolUsesRow;
+        if (range) {
+          const df = dfBinds(range);
+          try { articleLikesRow = await env.DB.prepare(`SELECT COALESCE(SUM(delta),0) AS n FROM article_like_events WHERE ${DATE_FILTER}`).bind(...df).first(); } catch (e) { articleLikesRow = { n: 0 }; }
+          try { toolLikesRow = await env.DB.prepare(`SELECT COALESCE(SUM(delta),0) AS n FROM tool_like_events WHERE ${DATE_FILTER}`).bind(...df).first(); } catch (e) { toolLikesRow = { n: 0 }; }
+          try { toolUsesRow = await env.DB.prepare(`SELECT COUNT(*) AS n FROM tool_usage_events WHERE ${DATE_FILTER}`).bind(...df).first(); } catch (e) { toolUsesRow = { n: 0 }; }
+        } else {
+          articleLikesRow = await env.DB.prepare("SELECT COALESCE(SUM(likes),0) AS n FROM article_likes").first();
+          toolLikesRow = await env.DB.prepare("SELECT COALESCE(SUM(likes),0) AS n FROM tool_likes").first();
+          toolUsesRow = await env.DB.prepare("SELECT COALESCE(SUM(uses),0) AS n FROM tool_usage").first();
+        }
+        const articleLikes = Math.max(0, Number(articleLikesRow?.n || 0));
+        const toolLikes = Math.max(0, Number(toolLikesRow?.n || 0));
         const totalVisitsN = Number(totalVisitsRow?.n || 0);
         const uniqueN = Number(uniqueVisitorsRow?.n || 0);
         const totalBlogViewsN = Number(totalBlogViewsRow?.n || 0);
@@ -218,8 +229,8 @@ export default {
         ).bind(liveThreshold).first();
         const totalRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM visits").first();
         const blogRow = await env.DB.prepare(
-          "SELECT COUNT(*) AS n FROM visits WHERE article_id LIKE ?"
-        ).bind(BLOG_ARTICLE_LIKE).first();
+          `SELECT COUNT(*) AS n FROM visits WHERE ${BLOG_WHERE}`
+        ).first();
         return json({
           success: true,
           live: row?.live || 0,
@@ -238,21 +249,21 @@ export default {
           const r = await env.DB.prepare(
             `SELECT article_id AS name, article_id AS url, COUNT(*) AS count
              FROM visits
-             WHERE article_id LIKE ? AND ${DATE_FILTER}
+             WHERE ${BLOG_WHERE} AND ${DATE_FILTER}
              GROUP BY article_id
              ORDER BY count DESC
              LIMIT ?`
-          ).bind(BLOG_ARTICLE_LIKE, ...df, limit).all();
+          ).bind(...df, limit).all();
           results = r.results;
         } else {
           const r = await env.DB.prepare(
             `SELECT article_id AS name, article_id AS url, COUNT(*) AS count
              FROM visits
-             WHERE article_id LIKE ?
+             WHERE ${BLOG_WHERE}
              GROUP BY article_id
              ORDER BY count DESC
              LIMIT ?`
-          ).bind(BLOG_ARTICLE_LIKE, limit).all();
+          ).bind(limit).all();
           results = r.results;
         }
         return json({ success: true, filtered: !!range, articles: results || [] });
@@ -324,10 +335,31 @@ export default {
 
       if (path === "/admin/article-likes" && request.method === "GET") {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 1000);
-        const { results } = await env.DB.prepare(
-          "SELECT article_id AS name, article_id AS url, likes AS count FROM article_likes WHERE likes > 0 ORDER BY likes DESC LIMIT ?"
-        ).bind(limit).all();
-        return json({ success: true, articles: results || [] });
+        const range = parseDateRange(url);
+        let results;
+        if (range) {
+          const df = dfBinds(range);
+          try {
+            const r = await env.DB.prepare(
+              `SELECT article_id AS name, article_id AS url, SUM(delta) AS count
+               FROM article_like_events
+               WHERE ${DATE_FILTER}
+               GROUP BY article_id
+               HAVING SUM(delta) > 0
+               ORDER BY count DESC
+               LIMIT ?`
+            ).bind(...df, limit).all();
+            results = r.results;
+          } catch (e) {
+            results = [];
+          }
+        } else {
+          const r = await env.DB.prepare(
+            "SELECT article_id AS name, article_id AS url, likes AS count FROM article_likes WHERE likes > 0 ORDER BY likes DESC LIMIT ?"
+          ).bind(limit).all();
+          results = r.results;
+        }
+        return json({ success: true, filtered: !!range, articles: results || [] });
       }
 
       // ---------- DAILY ACTIVITY ----------
@@ -421,6 +453,7 @@ export default {
         // v1.0.8: also clear event logs when they exist.
         try { await env.DB.prepare("DELETE FROM tool_usage_events").run(); } catch (e) {}
         try { await env.DB.prepare("DELETE FROM tool_like_events").run(); } catch (e) {}
+        try { await env.DB.prepare("DELETE FROM article_like_events").run(); } catch (e) {}
         return json({ success: true, cleared: true });
       }
 
