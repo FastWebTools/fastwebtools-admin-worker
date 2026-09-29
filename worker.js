@@ -457,7 +457,7 @@ export default {
         if(request.method==="DELETE"){
           const row=await env.DB.prepare("SELECT comment FROM comments WHERE id=?1").bind(id).first();
           await auditComment(env.DB,{action:"delete_comment",comment_id:id,admin:auth.username,old_text:row&&row.comment});
-          await env.DB.batch([env.DB.prepare("DELETE FROM reply_reactions WHERE reply_id IN (SELECT id FROM comment_replies WHERE comment_id=?1)").bind(id),env.DB.prepare("DELETE FROM comment_reactions WHERE comment_id=?1").bind(id),env.DB.prepare("DELETE FROM comment_replies WHERE comment_id=?1").bind(id),env.DB.prepare("DELETE FROM comments WHERE id=?1").bind(id)]);
+          await env.DB.batch([env.DB.prepare("DELETE FROM comment_reports WHERE comment_id=?1").bind(id),env.DB.prepare("DELETE FROM reply_reactions WHERE reply_id IN (SELECT id FROM comment_replies WHERE comment_id=?1)").bind(id),env.DB.prepare("DELETE FROM comment_reactions WHERE comment_id=?1").bind(id),env.DB.prepare("DELETE FROM comment_replies WHERE comment_id=?1").bind(id),env.DB.prepare("DELETE FROM comments WHERE id=?1").bind(id)]);
           return json({success:true,deleted:true});
         }
         if(request.method==="PUT"){
@@ -517,6 +517,7 @@ export default {
         try { await env.DB.prepare("DELETE FROM article_like_events").run(); } catch (e) {}
         try { await env.DB.prepare("DELETE FROM reply_reactions").run(); } catch (e) {}
         try { await env.DB.prepare("DELETE FROM comment_reactions").run(); } catch (e) {}
+        try { await env.DB.prepare("DELETE FROM comment_reports").run(); } catch (e) {}
         try { await env.DB.prepare("DELETE FROM comment_replies").run(); } catch (e) {}
         try { await env.DB.prepare("DELETE FROM comment_audit_log").run(); } catch (e) {}
         return json({ success: true, cleared: true });
