@@ -3,8 +3,8 @@
 // Bindings required:  DB (D1: fastwebtools-db)
 // ================================================================
 
-const WORKER_VERSION = "1.1.0-github";
-const DEPLOYED_AT = "2026-09-28";
+const WORKER_VERSION = "1.2.0-github";
+const DEPLOYED_AT = "2026-09-29";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -60,6 +60,30 @@ const DAY_EXPR = `CASE
   WHEN typeof(created_at)='text' THEN date(created_at)
   ELSE NULL
 END`;
+
+let adminCommentSchemaInit = false;
+async function adminBestEffort(db, sql) { try { await db.prepare(sql).run(); } catch (e) {} }
+async function ensureAdminCommentSchema(db) {
+  if (adminCommentSchemaInit) return;
+  await adminBestEffort(db, "ALTER TABLE comments ADD COLUMN owner_token_hash TEXT");
+  await adminBestEffort(db, "ALTER TABLE comments ADD COLUMN edited_once INTEGER NOT NULL DEFAULT 0");
+  await adminBestEffort(db, "ALTER TABLE comments ADD COLUMN edited_at INTEGER");
+  await adminBestEffort(db, "ALTER TABLE comments ADD COLUMN edited_by_admin INTEGER NOT NULL DEFAULT 0");
+  await adminBestEffort(db, "ALTER TABLE comments ADD COLUMN admin_edit_reason TEXT");
+  await adminBestEffort(db, "ALTER TABLE comments ADD COLUMN original_comment TEXT");
+  await adminBestEffort(db, "ALTER TABLE comments ADD COLUMN updated_at INTEGER");
+  await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, comment_id INTEGER NOT NULL, visitor_id TEXT NOT NULL, reaction INTEGER NOT NULL CHECK(reaction IN (-1,1)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(comment_id,visitor_id))");
+  await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_cr_comment ON comment_reactions(comment_id)");
+  await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_replies (id INTEGER PRIMARY KEY AUTOINCREMENT, comment_id INTEGER NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'published', is_official INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
+  await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_reply_comment ON comment_replies(comment_id)");
+  await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS reply_reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, reply_id INTEGER NOT NULL, visitor_id TEXT NOT NULL, reaction INTEGER NOT NULL CHECK(reaction IN (-1,1)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(reply_id,visitor_id))");
+  await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_rr_reply ON reply_reactions(reply_id)");
+  await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, comment_id INTEGER, reply_id INTEGER, admin_username TEXT, old_text TEXT, new_text TEXT, reason TEXT, created_at INTEGER NOT NULL)");
+  adminCommentSchemaInit = true;
+}
+async function auditComment(db, data) {
+  try { await db.prepare("INSERT INTO comment_audit_log (action,comment_id,reply_id,admin_username,old_text,new_text,reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)").bind(data.action||"unknown",data.comment_id||null,data.reply_id||null,data.admin||"admin",data.old_text||null,data.new_text||null,data.reason||null,Date.now()).run(); } catch(e) {}
+}
 
 async function sha256(text) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
@@ -396,35 +420,59 @@ export default {
       }
 
       if (path === "/admin/comments" && request.method === "GET") {
-        const range = parseDateRange(url);
-        let results;
-        if (range) {
-          const df = dfBinds(range);
-          const r = await env.DB.prepare(
-            `SELECT id, article_id, name, comment, status, created_at FROM comments WHERE ${DATE_FILTER} ORDER BY id DESC LIMIT 1000`
-          ).bind(...df).all();
-          results = r.results;
-        } else {
-          const r = await env.DB.prepare(
-            "SELECT id, article_id, name, comment, status, created_at FROM comments ORDER BY id DESC LIMIT 1000"
-          ).all();
-          results = r.results;
-        }
-        return json({ success: true, filtered: !!range, comments: results || [] });
+        await ensureAdminCommentSchema(env.DB);
+        const range=parseDateRange(url); let results;
+        const select=`SELECT c.id,c.article_id,c.name,c.comment,c.status,c.created_at,c.edited_once,c.edited_at,c.edited_by_admin,c.admin_edit_reason,c.original_comment,c.updated_at,
+          COALESCE((SELECT SUM(CASE WHEN reaction=1 THEN 1 ELSE 0 END) FROM comment_reactions r WHERE r.comment_id=c.id),0) AS likes,
+          COALESCE((SELECT SUM(CASE WHEN reaction=-1 THEN 1 ELSE 0 END) FROM comment_reactions r WHERE r.comment_id=c.id),0) AS dislikes,
+          COALESCE((SELECT COUNT(*) FROM comment_replies p WHERE p.comment_id=c.id),0) AS reply_count FROM comments c`;
+        if(range){const df=dfBinds(range);const r=await env.DB.prepare(`${select} WHERE ${DATE_FILTER.replaceAll('created_at','c.created_at')} ORDER BY c.id DESC LIMIT 1000`).bind(...df).all();results=r.results||[];}
+        else {const r=await env.DB.prepare(`${select} ORDER BY c.id DESC LIMIT 1000`).all();results=r.results||[];}
+        const ids=results.map(x=>Number(x.id)).filter(Boolean);let replies=[];
+        if(ids.length){const qs=ids.map(()=>"?").join(",");const rr=await env.DB.prepare(`SELECT p.id,p.comment_id,p.body,p.status,p.is_official,p.created_at,p.updated_at,
+          COALESCE((SELECT SUM(CASE WHEN reaction=1 THEN 1 ELSE 0 END) FROM reply_reactions x WHERE x.reply_id=p.id),0) AS likes,
+          COALESCE((SELECT SUM(CASE WHEN reaction=-1 THEN 1 ELSE 0 END) FROM reply_reactions x WHERE x.reply_id=p.id),0) AS dislikes
+          FROM comment_replies p WHERE p.comment_id IN (${qs}) ORDER BY p.id ASC`).bind(...ids).all();replies=rr.results||[];}
+        const map={};for(const r of replies){const k=String(r.comment_id);if(!map[k])map[k]=[];map[k].push(r);}for(const c of results)c.replies=map[String(c.id)]||[];
+        return json({success:true,filtered:!!range,comments:results});
       }
 
       const commentMatch = path.match(/^\/admin\/comment\/(\d+)$/);
       if (commentMatch) {
-        const id = parseInt(commentMatch[1], 10);
-        if (request.method === "DELETE") {
-          await env.DB.prepare("DELETE FROM comments WHERE id = ?").bind(id).run();
-          return json({ success: true });
+        await ensureAdminCommentSchema(env.DB);
+        const id=parseInt(commentMatch[1],10);
+        if(request.method==="DELETE"){
+          const row=await env.DB.prepare("SELECT comment FROM comments WHERE id=?1").bind(id).first();
+          await auditComment(env.DB,{action:"delete_comment",comment_id:id,admin:auth.username,old_text:row&&row.comment});
+          await env.DB.batch([env.DB.prepare("DELETE FROM reply_reactions WHERE reply_id IN (SELECT id FROM comment_replies WHERE comment_id=?1)").bind(id),env.DB.prepare("DELETE FROM comment_reactions WHERE comment_id=?1").bind(id),env.DB.prepare("DELETE FROM comment_replies WHERE comment_id=?1").bind(id),env.DB.prepare("DELETE FROM comments WHERE id=?1").bind(id)]);
+          return json({success:true,deleted:true});
         }
-        if (request.method === "PUT") {
-          const { status } = await request.json();
-          await env.DB.prepare("UPDATE comments SET status = ? WHERE id = ?").bind(status, id).run();
-          return json({ success: true });
+        if(request.method==="PUT"){
+          const body=await request.json();
+          if(typeof body.comment==="string"){
+            const text=body.comment.trim().slice(0,400),reason=String(body.reason||"Moderated by admin").slice(0,160);if(!text)return json({success:false,error:"Comment text is required"},400);
+            const old=await env.DB.prepare("SELECT comment,original_comment FROM comments WHERE id=?1").bind(id).first();if(!old)return json({success:false,error:"Comment not found"},404);
+            const now=Date.now();await env.DB.prepare("UPDATE comments SET original_comment=COALESCE(original_comment,comment),comment=?1,edited_once=1,edited_by_admin=1,edited_at=?2,updated_at=?2,admin_edit_reason=?3 WHERE id=?4").bind(text,now,reason,id).run();
+            await auditComment(env.DB,{action:"edit_user_comment",comment_id:id,admin:auth.username,old_text:old.comment,new_text:text,reason});return json({success:true,edited:true});
+          }
+          const status=body.status;if(!["published","pending","spam"].includes(status))return json({success:false,error:"Invalid status"},400);
+          await env.DB.prepare("UPDATE comments SET status=?1,updated_at=?2 WHERE id=?3").bind(status,Date.now(),id).run();await auditComment(env.DB,{action:"status_change",comment_id:id,admin:auth.username,reason:status});return json({success:true});
         }
+      }
+
+      const replyCreate=path.match(/^\/admin\/comment\/(\d+)\/reply$/);
+      if(replyCreate&&request.method==="POST"){
+        await ensureAdminCommentSchema(env.DB);const commentId=Number(replyCreate[1]),body=await request.json(),text=String(body.reply||"").trim().slice(0,800);if(!text)return json({success:false,error:"Reply is required"},400);
+        const exists=await env.DB.prepare("SELECT id FROM comments WHERE id=?1").bind(commentId).first();if(!exists)return json({success:false,error:"Comment not found"},404);
+        const now=Date.now(),official=body.is_official===false?0:1;const r=await env.DB.prepare("INSERT INTO comment_replies (comment_id,body,status,is_official,created_at,updated_at) VALUES (?1,?2,'published',?3,?4,?4)").bind(commentId,text,official,now).run();const replyId=Number(r&&r.meta&&r.meta.last_row_id||0);
+        await auditComment(env.DB,{action:"create_admin_reply",comment_id:commentId,reply_id:replyId,admin:auth.username,new_text:text});return json({success:true,reply:{id:replyId,comment_id:commentId,body:text,status:"published",is_official:official,created_at:now,likes:0,dislikes:0}});
+      }
+
+      const replyMatch=path.match(/^\/admin\/reply\/(\d+)$/);
+      if(replyMatch){
+        await ensureAdminCommentSchema(env.DB);const id=Number(replyMatch[1]);
+        if(request.method==="DELETE"){const old=await env.DB.prepare("SELECT comment_id,body FROM comment_replies WHERE id=?1").bind(id).first();await auditComment(env.DB,{action:"delete_admin_reply",comment_id:old&&old.comment_id,reply_id:id,admin:auth.username,old_text:old&&old.body});await env.DB.batch([env.DB.prepare("DELETE FROM reply_reactions WHERE reply_id=?1").bind(id),env.DB.prepare("DELETE FROM comment_replies WHERE id=?1").bind(id)]);return json({success:true,deleted:true});}
+        if(request.method==="PUT"){const body=await request.json(),old=await env.DB.prepare("SELECT comment_id,body FROM comment_replies WHERE id=?1").bind(id).first();if(!old)return json({success:false,error:"Reply not found"},404);const text=String(body.reply==null?old.body:body.reply).trim().slice(0,800);if(!text)return json({success:false,error:"Reply is required"},400);const official=body.is_official===false?0:1,status=["published","pending"].includes(body.status)?body.status:"published";await env.DB.prepare("UPDATE comment_replies SET body=?1,is_official=?2,status=?3,updated_at=?4 WHERE id=?5").bind(text,official,status,Date.now(),id).run();await auditComment(env.DB,{action:"edit_admin_reply",comment_id:old.comment_id,reply_id:id,admin:auth.username,old_text:old.body,new_text:text});return json({success:true,edited:true});}
       }
 
       if (path === "/admin/change-password" && request.method === "POST") {
@@ -454,6 +502,10 @@ export default {
         try { await env.DB.prepare("DELETE FROM tool_usage_events").run(); } catch (e) {}
         try { await env.DB.prepare("DELETE FROM tool_like_events").run(); } catch (e) {}
         try { await env.DB.prepare("DELETE FROM article_like_events").run(); } catch (e) {}
+        try { await env.DB.prepare("DELETE FROM reply_reactions").run(); } catch (e) {}
+        try { await env.DB.prepare("DELETE FROM comment_reactions").run(); } catch (e) {}
+        try { await env.DB.prepare("DELETE FROM comment_replies").run(); } catch (e) {}
+        try { await env.DB.prepare("DELETE FROM comment_audit_log").run(); } catch (e) {}
         return json({ success: true, cleared: true });
       }
 
