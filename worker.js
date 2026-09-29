@@ -3,7 +3,7 @@
 // Bindings required:  DB (D1: fastwebtools-db)
 // ================================================================
 
-const WORKER_VERSION = "1.2.0-github";
+const WORKER_VERSION = "1.2.1-github";
 const DEPLOYED_AT = "2026-09-29";
 
 const CORS = {
@@ -53,6 +53,13 @@ const DATE_FILTER = `(
   OR (typeof(created_at)='text' AND datetime(created_at) BETWEEN datetime(?) AND datetime(?))
 )`;
 function dfBinds(r) { return [r.fromMs, r.toMs, r.fromMs, r.toMs, r.fromISO, r.toISO]; }
+function normalizedTimeMs(value) {
+  if (value == null || value === "") return 0;
+  if (typeof value === "number") return value > 9999999999 ? value : value * 1000;
+  const raw=String(value).trim();
+  if (/^\d+(?:\.\d+)?$/.test(raw)) { const n=Number(raw); return Number.isFinite(n) ? (n > 9999999999 ? n : n*1000) : 0; }
+  const parsed=Date.parse(raw); return Number.isFinite(parsed) ? parsed : 0;
+}
 
 const DAY_EXPR = `CASE
   WHEN typeof(created_at)='integer' AND created_at > 9999999999 THEN date(created_at/1000, 'unixepoch')
@@ -426,14 +433,16 @@ export default {
           COALESCE((SELECT SUM(CASE WHEN reaction=1 THEN 1 ELSE 0 END) FROM comment_reactions r WHERE r.comment_id=c.id),0) AS likes,
           COALESCE((SELECT SUM(CASE WHEN reaction=-1 THEN 1 ELSE 0 END) FROM comment_reactions r WHERE r.comment_id=c.id),0) AS dislikes,
           COALESCE((SELECT COUNT(*) FROM comment_replies p WHERE p.comment_id=c.id),0) AS reply_count FROM comments c`;
-        if(range){const df=dfBinds(range);const r=await env.DB.prepare(`${select} WHERE ${DATE_FILTER.replaceAll('created_at','c.created_at')} ORDER BY c.id DESC LIMIT 1000`).bind(...df).all();results=r.results||[];}
-        else {const r=await env.DB.prepare(`${select} ORDER BY c.id DESC LIMIT 1000`).all();results=r.results||[];}
+        {const r=await env.DB.prepare(`${select} ORDER BY c.id DESC LIMIT 1000`).all();results=r.results||[];}
+        for(const c of results){c.created_at_raw=c.created_at;c.created_at_ms=normalizedTimeMs(c.created_at);c.created_at_iso=c.created_at_ms?new Date(c.created_at_ms).toISOString():null;}
+        if(range)results=results.filter(c=>c.created_at_ms>=range.fromMs&&c.created_at_ms<=range.toMs);
+        results.sort((a,b)=>(b.created_at_ms-a.created_at_ms)||(Number(b.id)-Number(a.id)));
         const ids=results.map(x=>Number(x.id)).filter(Boolean);let replies=[];
         if(ids.length){const qs=ids.map(()=>"?").join(",");const rr=await env.DB.prepare(`SELECT p.id,p.comment_id,p.body,p.status,p.is_official,p.created_at,p.updated_at,
           COALESCE((SELECT SUM(CASE WHEN reaction=1 THEN 1 ELSE 0 END) FROM reply_reactions x WHERE x.reply_id=p.id),0) AS likes,
           COALESCE((SELECT SUM(CASE WHEN reaction=-1 THEN 1 ELSE 0 END) FROM reply_reactions x WHERE x.reply_id=p.id),0) AS dislikes
           FROM comment_replies p WHERE p.comment_id IN (${qs}) ORDER BY p.id ASC`).bind(...ids).all();replies=rr.results||[];}
-        const map={};for(const r of replies){const k=String(r.comment_id);if(!map[k])map[k]=[];map[k].push(r);}for(const c of results)c.replies=map[String(c.id)]||[];
+        const map={};for(const r of replies){r.created_at_raw=r.created_at;r.created_at_ms=normalizedTimeMs(r.created_at);r.created_at_iso=r.created_at_ms?new Date(r.created_at_ms).toISOString():null;const k=String(r.comment_id);if(!map[k])map[k]=[];map[k].push(r);}for(const c of results)c.replies=(map[String(c.id)]||[]).sort((a,b)=>(a.created_at_ms-b.created_at_ms)||(Number(a.id)-Number(b.id)));
         return json({success:true,filtered:!!range,comments:results});
       }
 
