@@ -3,7 +3,7 @@
 // Bindings required:  DB (D1: fastwebtools-db)
 // ================================================================
 
-const WORKER_VERSION = "1.2.1-github";
+const WORKER_VERSION = "1.3.0-github";
 const DEPLOYED_AT = "2026-09-29";
 
 const CORS = {
@@ -82,7 +82,11 @@ async function ensureAdminCommentSchema(db) {
   await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, comment_id INTEGER NOT NULL, visitor_id TEXT NOT NULL, reaction INTEGER NOT NULL CHECK(reaction IN (-1,1)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(comment_id,visitor_id))");
   await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_cr_comment ON comment_reactions(comment_id)");
   await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_replies (id INTEGER PRIMARY KEY AUTOINCREMENT, comment_id INTEGER NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'published', is_official INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
+  await adminBestEffort(db, "ALTER TABLE comment_replies ADD COLUMN name TEXT");
+  await adminBestEffort(db, "ALTER TABLE comment_replies ADD COLUMN owner_token_hash TEXT");
   await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_reply_comment ON comment_replies(comment_id)");
+  await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, comment_id INTEGER NOT NULL, visitor_id TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, UNIQUE(comment_id, visitor_id))");
+  await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_report_comment ON comment_reports(comment_id)");
   await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS reply_reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, reply_id INTEGER NOT NULL, visitor_id TEXT NOT NULL, reaction INTEGER NOT NULL CHECK(reaction IN (-1,1)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(reply_id,visitor_id))");
   await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_rr_reply ON reply_reactions(reply_id)");
   await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, comment_id INTEGER, reply_id INTEGER, admin_username TEXT, old_text TEXT, new_text TEXT, reason TEXT, created_at INTEGER NOT NULL)");
@@ -432,13 +436,13 @@ export default {
         const select=`SELECT c.id,c.article_id,c.name,c.comment,c.status,c.created_at,c.edited_once,c.edited_at,c.edited_by_admin,c.admin_edit_reason,c.original_comment,c.updated_at,
           COALESCE((SELECT SUM(CASE WHEN reaction=1 THEN 1 ELSE 0 END) FROM comment_reactions r WHERE r.comment_id=c.id),0) AS likes,
           COALESCE((SELECT SUM(CASE WHEN reaction=-1 THEN 1 ELSE 0 END) FROM comment_reactions r WHERE r.comment_id=c.id),0) AS dislikes,
-          COALESCE((SELECT COUNT(*) FROM comment_replies p WHERE p.comment_id=c.id),0) AS reply_count FROM comments c`;
+          COALESCE((SELECT COUNT(*) FROM comment_replies p WHERE p.comment_id=c.id),0) AS reply_count, COALESCE((SELECT COUNT(*) FROM comment_reports q WHERE q.comment_id=c.id AND q.status='pending'),0) AS report_count FROM comments c`;
         {const r=await env.DB.prepare(`${select} ORDER BY c.id DESC LIMIT 1000`).all();results=r.results||[];}
         for(const c of results){c.created_at_raw=c.created_at;c.created_at_ms=normalizedTimeMs(c.created_at);c.created_at_iso=c.created_at_ms?new Date(c.created_at_ms).toISOString():null;}
         if(range)results=results.filter(c=>c.created_at_ms>=range.fromMs&&c.created_at_ms<=range.toMs);
         results.sort((a,b)=>(b.created_at_ms-a.created_at_ms)||(Number(b.id)-Number(a.id)));
         const ids=results.map(x=>Number(x.id)).filter(Boolean);let replies=[];
-        if(ids.length){const qs=ids.map(()=>"?").join(",");const rr=await env.DB.prepare(`SELECT p.id,p.comment_id,p.body,p.status,p.is_official,p.created_at,p.updated_at,
+        if(ids.length){const qs=ids.map(()=>"?").join(",");const rr=await env.DB.prepare(`SELECT p.id,p.comment_id,p.name,p.body,p.status,p.is_official,p.created_at,p.updated_at,
           COALESCE((SELECT SUM(CASE WHEN reaction=1 THEN 1 ELSE 0 END) FROM reply_reactions x WHERE x.reply_id=p.id),0) AS likes,
           COALESCE((SELECT SUM(CASE WHEN reaction=-1 THEN 1 ELSE 0 END) FROM reply_reactions x WHERE x.reply_id=p.id),0) AS dislikes
           FROM comment_replies p WHERE p.comment_id IN (${qs}) ORDER BY p.id ASC`).bind(...ids).all();replies=rr.results||[];}
