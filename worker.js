@@ -3,7 +3,7 @@
 // Bindings required:  DB (D1: fastwebtools-db)
 // ================================================================
 
-const WORKER_VERSION = "1.4.0-github";
+const WORKER_VERSION = "1.5.0-github";
 const DEPLOYED_AT = "2026-09-30";
 
 const CORS = {
@@ -398,6 +398,18 @@ export default {
           results = r.results;
         }
         return json({ success: true, filtered: !!range, articles: results || [] });
+      }
+
+      // ---------- NAVIGATION BADGE COUNTS ----------
+      // Lightweight all-time totals used by both desktop and mobile navigation.
+      if (path === "/admin/badge-counts" && request.method === "GET") {
+        await ensureAdminCommentSchema(env.DB);
+        const commentRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM comments").first();
+        const reportRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM comment_reports WHERE status='pending'").first();
+        let toolLikes = 0, articleLikes = 0;
+        try { const row = await env.DB.prepare("SELECT COALESCE(SUM(likes),0) AS n FROM tool_likes").first(); toolLikes = Number(row?.n || 0); } catch (e) {}
+        try { const row = await env.DB.prepare("SELECT COALESCE(SUM(likes),0) AS n FROM article_likes").first(); articleLikes = Number(row?.n || 0); } catch (e) {}
+        return json({success:true,counts:{comments:Number(commentRow?.n||0),reports:Number(reportRow?.n||0),tool_likes:toolLikes,article_likes:articleLikes}});
       }
 
       // ---------- DAILY ACTIVITY ----------
