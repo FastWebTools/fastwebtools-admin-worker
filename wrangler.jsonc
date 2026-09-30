@@ -1,5 +1,5 @@
 // FastWebTools admin backend — Cloudflare Worker + D1
-// Latest deploy: v1.0.7 - robust DATE_FILTER (int ms + int sec + ISO text) + /admin/diag
+// Latest deploy: v1.6.0 - synchronized unseen dashboard badge tracking
 {
   "name": "fastwebtools-admin",
   "main": "worker.js",
