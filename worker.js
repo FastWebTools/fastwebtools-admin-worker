@@ -3,7 +3,7 @@
 // Bindings required:  DB (D1: fastwebtools-db)
 // ================================================================
 
-const WORKER_VERSION = "1.5.0-github";
+const WORKER_VERSION = "1.6.0-github";
 const DEPLOYED_AT = "2026-09-30";
 
 const CORS = {
@@ -93,6 +93,7 @@ async function ensureAdminCommentSchema(db) {
   await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS reply_reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, reply_id INTEGER NOT NULL, visitor_id TEXT NOT NULL, reaction INTEGER NOT NULL CHECK(reaction IN (-1,1)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(reply_id,visitor_id))");
   await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_rr_reply ON reply_reactions(reply_id)");
   await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, comment_id INTEGER, reply_id INTEGER, admin_username TEXT, old_text TEXT, new_text TEXT, reason TEXT, created_at INTEGER NOT NULL)");
+  await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS admin_badge_reads (username TEXT NOT NULL, badge_key TEXT NOT NULL, last_seen_id INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY(username,badge_key))");
   adminCommentSchemaInit = true;
 }
 async function auditComment(db, data) {
@@ -401,15 +402,31 @@ export default {
       }
 
       // ---------- NAVIGATION BADGE COUNTS ----------
-      // Lightweight all-time totals used by both desktop and mobile navigation.
+      // Reports remain pending until reviewed. Other badges count unseen events
+      // since this admin last opened the matching page, synchronized across devices.
       if (path === "/admin/badge-counts" && request.method === "GET") {
         await ensureAdminCommentSchema(env.DB);
-        const commentRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM comments").first();
+        const readRows = await env.DB.prepare("SELECT badge_key,last_seen_id FROM admin_badge_reads WHERE username=?1").bind(auth.username).all();
+        const seen = {comments:0,tools:0,articles:0};
+        for (const row of (readRows.results||[])) if (Object.prototype.hasOwnProperty.call(seen,row.badge_key)) seen[row.badge_key]=Number(row.last_seen_id||0);
+        let comments=0,toolLikes=0,articleLikes=0;
+        try { const row=await env.DB.prepare("SELECT COUNT(*) AS n FROM comments WHERE id>?1").bind(seen.comments).first(); comments=Number(row?.n||0); } catch(e) {}
+        try { const row=await env.DB.prepare("SELECT COUNT(*) AS n FROM tool_like_events WHERE id>?1 AND delta>0").bind(seen.tools).first(); toolLikes=Number(row?.n||0); } catch(e) {}
+        try { const row=await env.DB.prepare("SELECT COUNT(*) AS n FROM article_like_events WHERE id>?1 AND delta>0").bind(seen.articles).first(); articleLikes=Number(row?.n||0); } catch(e) {}
         const reportRow = await env.DB.prepare("SELECT COUNT(*) AS n FROM comment_reports WHERE status='pending'").first();
-        let toolLikes = 0, articleLikes = 0;
-        try { const row = await env.DB.prepare("SELECT COALESCE(SUM(likes),0) AS n FROM tool_likes").first(); toolLikes = Number(row?.n || 0); } catch (e) {}
-        try { const row = await env.DB.prepare("SELECT COALESCE(SUM(likes),0) AS n FROM article_likes").first(); articleLikes = Number(row?.n || 0); } catch (e) {}
-        return json({success:true,counts:{comments:Number(commentRow?.n||0),reports:Number(reportRow?.n||0),tool_likes:toolLikes,article_likes:articleLikes}});
+        return json({success:true,counts:{comments,reports:Number(reportRow?.n||0),tool_likes:toolLikes,article_likes:articleLikes},mode:"unseen"});
+      }
+
+      if (path === "/admin/badge-seen" && request.method === "POST") {
+        await ensureAdminCommentSchema(env.DB);
+        const body=await request.json();
+        const key=String(body.badge||"");
+        if (!["comments","tools","articles"].includes(key)) return json({success:false,error:"Invalid badge"},400);
+        const table=key==="comments"?"comments":(key==="tools"?"tool_like_events":"article_like_events");
+        let maxId=0;
+        try { const row=await env.DB.prepare(`SELECT COALESCE(MAX(id),0) AS n FROM ${table}`).first(); maxId=Number(row?.n||0); } catch(e) {}
+        await env.DB.prepare("INSERT INTO admin_badge_reads (username,badge_key,last_seen_id,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(username,badge_key) DO UPDATE SET last_seen_id=excluded.last_seen_id,updated_at=excluded.updated_at").bind(auth.username,key,maxId,Date.now()).run();
+        return json({success:true,badge:key,last_seen_id:maxId});
       }
 
       // ---------- DAILY ACTIVITY ----------
