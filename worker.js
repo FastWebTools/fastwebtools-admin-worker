@@ -3,8 +3,8 @@
 // Bindings required:  DB (D1: fastwebtools-db)
 // ================================================================
 
-const WORKER_VERSION = "1.3.0-github";
-const DEPLOYED_AT = "2026-09-29";
+const WORKER_VERSION = "1.4.0-github";
+const DEPLOYED_AT = "2026-09-30";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -86,6 +86,9 @@ async function ensureAdminCommentSchema(db) {
   await adminBestEffort(db, "ALTER TABLE comment_replies ADD COLUMN owner_token_hash TEXT");
   await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_reply_comment ON comment_replies(comment_id)");
   await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS comment_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, comment_id INTEGER NOT NULL, visitor_id TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, UNIQUE(comment_id, visitor_id))");
+  await adminBestEffort(db, "ALTER TABLE comment_reports ADD COLUMN details TEXT");
+  await adminBestEffort(db, "ALTER TABLE comment_reports ADD COLUMN reviewed_at INTEGER");
+  await adminBestEffort(db, "ALTER TABLE comment_reports ADD COLUMN reviewed_by TEXT");
   await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_report_comment ON comment_reports(comment_id)");
   await adminBestEffort(db, "CREATE TABLE IF NOT EXISTS reply_reactions (id INTEGER PRIMARY KEY AUTOINCREMENT, reply_id INTEGER NOT NULL, visitor_id TEXT NOT NULL, reaction INTEGER NOT NULL CHECK(reaction IN (-1,1)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(reply_id,visitor_id))");
   await adminBestEffort(db, "CREATE INDEX IF NOT EXISTS idx_rr_reply ON reply_reactions(reply_id)");
@@ -446,7 +449,11 @@ export default {
           COALESCE((SELECT SUM(CASE WHEN reaction=1 THEN 1 ELSE 0 END) FROM reply_reactions x WHERE x.reply_id=p.id),0) AS likes,
           COALESCE((SELECT SUM(CASE WHEN reaction=-1 THEN 1 ELSE 0 END) FROM reply_reactions x WHERE x.reply_id=p.id),0) AS dislikes
           FROM comment_replies p WHERE p.comment_id IN (${qs}) ORDER BY p.id ASC`).bind(...ids).all();replies=rr.results||[];}
-        const map={};for(const r of replies){r.created_at_raw=r.created_at;r.created_at_ms=normalizedTimeMs(r.created_at);r.created_at_iso=r.created_at_ms?new Date(r.created_at_ms).toISOString():null;const k=String(r.comment_id);if(!map[k])map[k]=[];map[k].push(r);}for(const c of results)c.replies=(map[String(c.id)]||[]).sort((a,b)=>(a.created_at_ms-b.created_at_ms)||(Number(a.id)-Number(b.id)));
+        const map={};for(const r of replies){r.created_at_raw=r.created_at;r.created_at_ms=normalizedTimeMs(r.created_at);r.created_at_iso=r.created_at_ms?new Date(r.created_at_ms).toISOString():null;const k=String(r.comment_id);if(!map[k])map[k]=[];map[k].push(r);}
+        let reports=[];
+        if(ids.length){const qs=ids.map(()=>"?").join(",");const qr=await env.DB.prepare(`SELECT id,comment_id,visitor_id,reason,details,status,created_at,reviewed_at,reviewed_by FROM comment_reports WHERE comment_id IN (${qs}) ORDER BY id DESC`).bind(...ids).all();reports=qr.results||[];}
+        const reportMap={};for(const q of reports){q.created_at_raw=q.created_at;q.created_at_ms=normalizedTimeMs(q.created_at);q.created_at_iso=q.created_at_ms?new Date(q.created_at_ms).toISOString():null;const k=String(q.comment_id);if(!reportMap[k])reportMap[k]=[];reportMap[k].push(q);}
+        for(const c of results){c.replies=(map[String(c.id)]||[]).filter(r=>Number(r.is_official)!==0).sort((a,b)=>(a.created_at_ms-b.created_at_ms)||(Number(a.id)-Number(b.id)));c.reports=(reportMap[String(c.id)]||[]);}
         return json({success:true,filtered:!!range,comments:results});
       }
 
@@ -471,6 +478,15 @@ export default {
           const status=body.status;if(!["published","pending","spam"].includes(status))return json({success:false,error:"Invalid status"},400);
           await env.DB.prepare("UPDATE comments SET status=?1,updated_at=?2 WHERE id=?3").bind(status,Date.now(),id).run();await auditComment(env.DB,{action:"status_change",comment_id:id,admin:auth.username,reason:status});return json({success:true});
         }
+      }
+
+      const reportMatch=path.match(/^\/admin\/report\/(\d+)$/);
+      if(reportMatch&&request.method==="PUT"){
+        await ensureAdminCommentSchema(env.DB);const id=Number(reportMatch[1]),body=await request.json();
+        const status=String(body.status||"");if(!["pending","reviewed","dismissed"].includes(status))return json({success:false,error:"Invalid report status"},400);
+        const r=await env.DB.prepare("UPDATE comment_reports SET status=?1,reviewed_at=?2,reviewed_by=?3 WHERE id=?4").bind(status,status==="pending"?null:Date.now(),status==="pending"?null:auth.username,id).run();
+        if(!r||!r.meta||!r.meta.changes)return json({success:false,error:"Report not found"},404);
+        return json({success:true,status});
       }
 
       const replyCreate=path.match(/^\/admin\/comment\/(\d+)\/reply$/);
