@@ -1,0 +1,38 @@
+name: check
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - add-safety-2026-10-05
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: safety-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: JavaScript syntax (not functional tests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in worker.js; do
+            cp "$f" /tmp/fwt-check.mjs
+            node --check /tmp/fwt-check.mjs
+            echo "Syntax OK: $f"
+          done
+      - name: Wrangler build dry-run (never deploy)
+        env:
+          CI: 'true'
+          WRANGLER_SEND_METRICS: 'false'
+        run: npx --yes wrangler@4 deploy --dry-run --outdir /tmp/fwt-dry-run
