@@ -36,3 +36,4 @@ jobs:
           CI: 'true'
           WRANGLER_SEND_METRICS: 'false'
         run: npx --yes wrangler@4 deploy --dry-run --outdir /tmp/fwt-dry-run
+# Re-run safety checks after confirming GitHub Actions are enabled.
